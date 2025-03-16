@@ -1,0 +1,93 @@
+import os
+import json
+import logging
+import requests
+import datetime
+import time
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.resourcegraph import ResourceGraphClient
+
+# Configuration
+CHATBOT_API_URL = os.getenv("CHATBOT_API_URL", "http://127.0.0.1:5002")
+SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
+DISCOVERY_DIR = os.getenv("DISCOVERY_DIR", "/data")
+
+# Logging setup
+LOG_FILE = os.path.join(DISCOVERY_DIR, "agent.log")
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Ensure discovery directory exists
+os.makedirs(DISCOVERY_DIR, exist_ok=True)
+
+# Azure authentication
+credential = DefaultAzureCredential()
+resource_graph_client = ResourceGraphClient(credential)
+
+def discover_resources():
+    """Performs Azure resource discovery using Resource Graph."""
+    try:
+        logging.info(f"🔍 Starting resource discovery for subscription: {SUBSCRIPTION_ID}")
+
+        query = "Resources | project name, type, resourceGroup, location, properties"
+        response = resource_graph_client.resources(query={"query": query, "subscriptions": [SUBSCRIPTION_ID]})
+
+        categorized_resources = {
+            "compute": [],
+            "networking": [],
+            "storage": [],
+            "security": [],
+            "other": []
+        }
+
+        for item in response.data:
+            resource_info = {
+                "name": item["name"],
+                "resource_group": item["resourceGroup"],
+                "location": item["location"],
+                "properties": item.get("properties", {})
+            }
+
+            # Categorizing resources
+            if "compute" in item["type"].lower() or "managedclusters" in item["type"].lower():
+                categorized_resources["compute"].append(resource_info)
+            elif "network" in item["type"].lower():
+                categorized_resources["networking"].append(resource_info)
+            elif "storage" in item["type"].lower():
+                categorized_resources["storage"].append(resource_info)
+            elif "security" in item["type"].lower():
+                categorized_resources["security"].append(resource_info)
+            else:
+                categorized_resources["other"].append(resource_info)
+
+        # Save JSON file
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        filename = f"discovery_{SUBSCRIPTION_ID}_{timestamp}.json"
+        filepath = os.path.join(DISCOVERY_DIR, filename)
+
+        with open(filepath, "w") as json_file:
+            json.dump(categorized_resources, json_file, indent=2)
+
+        logging.info(f"✅ Discovery completed. Resources found: {len(response.data)}. File saved: {filepath}")
+
+        # Send discovery data to chatbot service
+        send_data_to_chatbot(categorized_resources)
+
+    except Exception as e:
+        logging.error(f"❌ Discovery failed: {str(e)}")
+
+def send_data_to_chatbot(discovery_data):
+    """Sends discovery data to the chatbot service for analysis."""
+    try:
+        response = requests.post(f"{CHATBOT_API_URL}/ingest", json={"data": discovery_data})
+        if response.status_code == 200:
+            logging.info("✅ Discovery data successfully sent to chatbot.")
+        else:
+            logging.error(f"⚠️ Error sending data: {response.status_code} - {response.text}")
+    except Exception as e:
+        logging.error(f"❌ Failed to send discovery data: {e}")
+
+if __name__ == "__main__":
+    while True:
+        discover_resources()
+        logging.info("⏳ Waiting for the next discovery cycle (1 minute)...")
+        time.sleep(60)  # Run every 60 seconds

@@ -1,60 +1,47 @@
 import os
 import json
 import logging
-import datetime
 import requests
+import datetime
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
 
-# Configuration Variables
-CHATBOT_API_URL = os.getenv("CHATBOT_API_URL", "http://127.0.0.1:5002/chat")  # URL to send discovery results
-SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")  # The Azure subscription ID to scan
-DISCOVERY_DIR = os.getenv("DISCOVERY_DIR", "/data")  # Directory where discovery data is stored
+DATA_DIR = os.getenv("DISCOVERY_DIR", "/data")
+LOG_FILE = os.path.join(DATA_DIR, "agent.log")
 
-# Ensure discovery directory exists
-os.makedirs(DISCOVERY_DIR, exist_ok=True)
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-# Logging Setup
-LOG_FILE = os.path.join(DISCOVERY_DIR, "agent.log")
+try:
+    os.chmod(DATA_DIR, 0o755)  # Owner can read/write, others can read
+    if os.path.exists(LOG_FILE):
+        os.chmod(LOG_FILE, 0o644)  # Log file: owner read/write, others read-only
+except Exception as e:
+    print(f"⚠️ Warning: Could not update permissions for {DATA_DIR} - {e}")
+
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Azure Authentication
 credential = DefaultAzureCredential()
+subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
+
+if not subscription_id:
+    logging.error("❌ AZURE_SUBSCRIPTION_ID is not set. Please provide a valid subscription.")
+    raise ValueError("AZURE_SUBSCRIPTION_ID is required!")
+
 resource_graph_client = ResourceGraphClient(credential)
 
-def log_message(message):
-    """Logs messages locally and prints them to console."""
-    logging.info(message)
-    print(message)
-
-def discover_resources():
-    """Scans Azure resources and saves structured discovery results."""
+def run_discovery():
+    """Perform Azure resource discovery and send results to chatbot API."""
     try:
-        log_message(f"🔍 Running discovery for subscription: {SUBSCRIPTION_ID}")
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        output_file = os.path.join(DATA_DIR, f"discovery_{subscription_id}_{timestamp}.json")
 
-        # Azure Resource Graph Query
-        query = """
-        Resources 
-        | project name, type, resourceGroup, location, properties
-        """
+        logging.info(f"🔍 Starting discovery for subscription {subscription_id}...")
 
-        response = resource_graph_client.resources(
-            query={"query": query, "subscriptions": [SUBSCRIPTION_ID]}
-        )
+        query = "Resources | project name, type, resourceGroup, location, properties"
+        response = resource_graph_client.resources(query={"query": query, "subscriptions": [subscription_id]})
 
-        if not response.data:
-            log_message("⚠️ No resources found in the subscription.")
-            return
-
-        categorized_resources = {
-            "compute": [],
-            "networking": [],
-            "storage": [],
-            "security": [],
-            "databases": [],
-            "other": []
-        }
-
+        categorized_resources = {"compute": [], "networking": [], "storage": [], "security": [], "other": []}
         for item in response.data:
             resource_info = {
                 "name": item["name"],
@@ -62,52 +49,38 @@ def discover_resources():
                 "location": item["location"],
                 "properties": item.get("properties", {})
             }
-
-            # Categorizing Resources
-            if "compute" in item["type"].lower() or "managedclusters" in item["type"].lower():
+            if "compute" in item["type"].lower():
                 categorized_resources["compute"].append(resource_info)
-            elif "network" in item["type"].lower() or "publicip" in item["type"].lower() or "loadbalancer" in item["type"].lower():
+            elif "network" in item["type"].lower():
                 categorized_resources["networking"].append(resource_info)
-            elif "storage" in item["type"].lower() or "disk" in item["type"].lower():
+            elif "storage" in item["type"].lower():
                 categorized_resources["storage"].append(resource_info)
-            elif "security" in item["type"].lower() or "managedidentity" in item["type"].lower():
+            elif "security" in item["type"].lower():
                 categorized_resources["security"].append(resource_info)
-            elif "sql" in item["type"].lower() or "database" in item["type"].lower():
-                categorized_resources["databases"].append(resource_info)
             else:
                 categorized_resources["other"].append(resource_info)
 
-        # Save Discovery Data to File
-        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        filename = f"discovery_{SUBSCRIPTION_ID}_{timestamp}.json"
-        filepath = os.path.join(DISCOVERY_DIR, filename)
-
-        with open(filepath, "w") as json_file:
+        with open(output_file, "w") as json_file:
             json.dump(categorized_resources, json_file, indent=2)
 
-        log_message(f"✅ Discovery completed. Resources found: {len(response.data)}. File saved: {filepath}")
+        logging.info(f"✅ Discovery completed. Resources found: {len(response.data)}. File saved: {output_file}")
 
-        # Send Discovery Data to Chatbot API
-        send_to_chatbot(filepath)
+        chatbot_api_url = os.getenv("CHATBOT_API_URL", "http://127.0.0.1:5002/chat/analyze")
+        send_data_to_chatbot(categorized_resources, chatbot_api_url)
 
     except Exception as e:
-        log_message(f"❌ Discovery failed: {str(e)}")
+        logging.error(f"❌ Discovery failed: {e}")
 
-def send_to_chatbot(filepath):
-    """Sends the discovery results to the chatbot API."""
+def send_data_to_chatbot(discovery_data, api_url):
+    """Send discovery data to the chatbot API for analysis."""
     try:
-        with open(filepath, "r") as file:
-            discovery_data = json.load(file)
-
-        response = requests.post(CHATBOT_API_URL, json=discovery_data)
-
+        response = requests.post(api_url, json=discovery_data)
         if response.status_code == 200:
-            log_message("✅ Discovery results successfully sent to chatbot.")
+            logging.info("📤 Discovery data successfully sent to chatbot API.")
         else:
-            log_message(f"⚠️ Failed to send data. Status Code: {response.status_code}")
-
+            logging.error(f"⚠️ Failed to send data. Status: {response.status_code}, Response: {response.text}")
     except Exception as e:
-        log_message(f"❌ Error sending data to chatbot: {str(e)}")
+        logging.error(f"⚠️ Error sending data to chatbot API: {e}")
 
 if __name__ == "__main__":
-    discover_resources()
+    run_discovery()
